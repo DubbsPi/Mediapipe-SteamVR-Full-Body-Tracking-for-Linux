@@ -16,5 +16,5 @@ Run open SteamVR and then run the run.sh with options
 Run uninstall.sh\
 It will remove the driver and python environment
 
-**To Do:**
+**To Do:**\
 Add emulated controllers to hands connect to a physical console controller
