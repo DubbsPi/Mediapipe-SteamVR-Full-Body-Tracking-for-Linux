@@ -5,6 +5,7 @@ Installed programs: SteamVR\
 Everything else is installed with the installer
 
 -- To install:\
+Initially run git clone on the repository\
 Run install.sh\
 It will install all requirements (aside from SteamVR) and drivers
 
