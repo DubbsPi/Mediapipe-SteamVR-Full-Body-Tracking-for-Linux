@@ -8,6 +8,9 @@ vr_steam_directory=$(find ~ -name "SteamVR" -type d -path "*/steamapps/common/St
 
 cd $script_directory
 
+echo "Steam directory:"
+echo $vr_steam_directory
+
 echo "Installing requirements"
 sudo apt update
 sudo apt install python3.12 python3.12-venv
@@ -16,7 +19,7 @@ echo "Creating virtual environment"
 python3.12 -m venv python_env
 source python_env/bin/activate
 
-pip install opencv-python mediapipe Pillow pygame argparse
+pip install opencv-python mediapipe Pillow pygame argparse argparse
 
 echo "Copying driver into SteamVR"
 cp -r mediapipe_driver $vr_steam_directory/drivers

@@ -3,48 +3,78 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <string>
+#include <memory>
+#include <map>
+#include <cmath> // Required for sqrt, acos, etc.
+#include <cstring>
+
+// Linux-specific socket includes
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include <chrono>
+#include <fcntl.h>
 
 using namespace vr;
 
-// Simple tracker device class
-class TrackerDevice : public ITrackedDeviceServerDriver {
+// =================================================================
+// VR Controller Device
+// =================================================================
+class VRControllerDevice : public ITrackedDeviceServerDriver {
 private:
     uint32_t device_index_ = k_unTrackedDeviceIndexInvalid;
     std::string serial_;
     DriverPose_t pose_;
-    std::atomic<bool> pose_updated_{false};
+    bool is_left_hand_;
+
+    // Input handles
+    VRInputComponentHandle_t trigger_click_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t trigger_value_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t grip_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t system_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t menu_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t trackpad_x_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t trackpad_y_component_ = k_ulInvalidInputComponentHandle;
+    VRInputComponentHandle_t trackpad_click_component_ = k_ulInvalidInputComponentHandle;
 
 public:
-    TrackerDevice(const std::string& serial) : serial_(serial) {
-        // Initialize pose
+    VRControllerDevice(const std::string& serial, bool is_left)
+    : serial_(serial), is_left_hand_(is_left) {
         pose_ = {};
         pose_.poseIsValid = true;
         pose_.result = TrackingResult_Running_OK;
         pose_.deviceIsConnected = true;
 
-        // Set initial position (origin)
-        pose_.qWorldFromDriverRotation.w = 1.0;
-        pose_.qDriverFromHeadRotation.w = 1.0;
-        pose_.vecPosition[0] = 0.0;
-        pose_.vecPosition[1] = 1.0;  // 1 meter up
-        pose_.vecPosition[2] = 0.0;
+        // FIX: HmdQuaternion_t has 4 members (w, x, y, z), not 5.
+        pose_.qWorldFromDriverRotation = { 1.0, 0.0, 0.0, 0.0 };
+        pose_.qDriverFromHeadRotation = { 1.0, 0.0, 0.0, 0.0 };
+
+        pose_.vecPosition[0] = is_left ? -0.2 : 0.2; // Initial position
+        pose_.vecPosition[1] = 1.0;
+        pose_.vecPosition[2] = -0.3;
     }
 
-    // ITrackedDeviceServerDriver methods
     EVRInitError Activate(uint32_t unObjectId) override {
         device_index_ = unObjectId;
 
-        // Set up device properties
-        auto props = VRProperties();
-        props->SetStringProperty(device_index_, Prop_ModelNumber_String, "MediaPipe Tracker");
-        props->SetStringProperty(device_index_, Prop_SerialNumber_String, serial_.c_str());
-        props->SetInt32Property(device_index_, Prop_DeviceClass_Int32, TrackedDeviceClass_GenericTracker);
+        // --- Property registration ---
+        VRProperties()->SetStringProperty(device_index_, Prop_SerialNumber_String, serial_.c_str());
+        VRProperties()->SetBoolProperty(device_index_, Prop_WillDriftInYaw_Bool, false);
+        VRProperties()->SetStringProperty(device_index_, Prop_RenderModelName_String, "vr_controller_vive_1_5");
+        VRProperties()->SetInt32Property(device_index_, Prop_DeviceClass_Int32, TrackedDeviceClass_Controller);
+        VRProperties()->SetInt32Property(device_index_, Prop_ControllerRoleHint_Int32, is_left_hand_ ? TrackedControllerRole_LeftHand : TrackedControllerRole_RightHand);
 
-        std::cout << "Tracker activated: " << serial_ << " (ID: " << device_index_ << ")" << std::endl;
+        // --- Input component creation ---
+        VRDriverInput()->CreateBooleanComponent(device_index_, "/input/trigger/click", &trigger_click_component_);
+        VRDriverInput()->CreateScalarComponent(device_index_, "/input/trigger/value", &trigger_value_component_, VRScalarType_Absolute, VRScalarUnits_NormalizedOneSided);
+        VRDriverInput()->CreateBooleanComponent(device_index_, "/input/grip/click", &grip_component_);
+        VRDriverInput()->CreateBooleanComponent(device_index_, "/input/system/click", &system_component_);
+        VRDriverInput()->CreateBooleanComponent(device_index_, "/input/application_menu/click", &menu_component_);
+        VRDriverInput()->CreateBooleanComponent(device_index_, "/input/trackpad/click", &trackpad_click_component_);
+        VRDriverInput()->CreateScalarComponent(device_index_, "/input/trackpad/x", &trackpad_x_component_, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+        VRDriverInput()->CreateScalarComponent(device_index_, "/input/trackpad/y", &trackpad_y_component_, VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided);
+
         return VRInitError_None;
     }
 
@@ -53,104 +83,160 @@ public:
     }
 
     void EnterStandby() override {}
-    void* GetComponent(const char* pchComponentNameAndVersion) override { return nullptr; }
+
+    void* GetComponent(const char* pchComponentNameAndVersion) override {
+        return nullptr;
+    }
+
     void DebugRequest(const char* pchRequest, char* pchResponseBuffer, uint32_t unResponseBufferSize) override {}
 
     DriverPose_t GetPose() override {
         return pose_;
     }
 
-    // Custom method to update pose from Python
+    // Update pose with new position and rotation data
     void UpdatePose(double x, double y, double z, double qw, double qx, double qy, double qz) {
         pose_.vecPosition[0] = x;
         pose_.vecPosition[1] = y;
         pose_.vecPosition[2] = z;
+        pose_.qRotation = { qw, qx, qy, qz };
 
-        pose_.qRotation.w = qw;
-        pose_.qRotation.x = qx;
-        pose_.qRotation.y = qy;
-        pose_.qRotation.z = qz;
-
-        pose_.poseTimeOffset = 0.0;
-        pose_updated_ = true;
-
-        // Tell SteamVR the pose updated
         if (device_index_ != k_unTrackedDeviceIndexInvalid) {
             VRServerDriverHost()->TrackedDevicePoseUpdated(device_index_, pose_, sizeof(DriverPose_t));
         }
     }
 };
 
-// Main driver class
+// =================================================================
+// Generic Tracker Device
+// =================================================================
+class TrackerDevice : public ITrackedDeviceServerDriver {
+private:
+    uint32_t device_index_ = k_unTrackedDeviceIndexInvalid;
+    std::string serial_;
+    DriverPose_t pose_;
+    std::string role_;
+
+public:
+    TrackerDevice(const std::string& serial, const std::string& role)
+    : serial_(serial), role_(role) {
+        pose_ = {};
+        pose_.poseIsValid = true;
+        pose_.result = TrackingResult_Running_OK;
+        pose_.deviceIsConnected = true;
+        // FIX: HmdQuaternion_t has 4 members (w, x, y, z), not 5.
+        pose_.qWorldFromDriverRotation = { 1.0, 0.0, 0.0, 0.0 };
+        pose_.qDriverFromHeadRotation = { 1.0, 0.0, 0.0, 0.0 };
+    }
+
+    EVRInitError Activate(uint32_t unObjectId) override {
+        device_index_ = unObjectId;
+
+        VRProperties()->SetStringProperty(device_index_, Prop_SerialNumber_String, serial_.c_str());
+        VRProperties()->SetStringProperty(device_index_, Prop_ModelNumber_String, "MediaPipe Tracker");
+        VRProperties()->SetStringProperty(device_index_, Prop_RenderModelName_String, "{htc}vr_tracker_vive_1_0"); // A default tracker model
+
+        std::cout << "Tracker activated: " << serial_ << " as " << role_ << " (ID: " << device_index_ << ")" << std::endl;
+        return VRInitError_None;
+    }
+
+    void Deactivate() override {
+        device_index_ = k_unTrackedDeviceIndexInvalid;
+    }
+
+    void EnterStandby() override {}
+
+    void* GetComponent(const char* pchComponentNameAndVersion) override {
+        return nullptr;
+    }
+
+    void DebugRequest(const char* pchRequest, char* pchResponseBuffer, uint32_t unResponseBufferSize) override {}
+
+    DriverPose_t GetPose() override {
+        return pose_;
+    }
+
+    void UpdatePose(double x, double y, double z, double qw, double qx, double qy, double qz) {
+        pose_.vecPosition[0] = x;
+        pose_.vecPosition[1] = y;
+        pose_.vecPosition[2] = z;
+        pose_.qRotation = { qw, qx, qy, qz };
+
+        if (device_index_ != k_unTrackedDeviceIndexInvalid) {
+            VRServerDriverHost()->TrackedDevicePoseUpdated(device_index_, pose_, sizeof(DriverPose_t));
+        }
+    }
+};
+
+// =================================================================
+// Main Driver Provider
+// =================================================================
 class MediaPipeDriver : public IServerTrackedDeviceProvider {
 private:
-    std::vector<std::unique_ptr<TrackerDevice>> trackers_;
+    std::unique_ptr<VRControllerDevice> left_controller_;
+    std::unique_ptr<VRControllerDevice> right_controller_;
+    std::map<int, std::unique_ptr<TrackerDevice>> trackers_;
     std::thread communication_thread_;
-    std::atomic<bool> running_{false};
+    std::atomic<bool> running_{ false };
+    int server_fd_ = -1; // Keep track of the server socket
 
-    // Communication data structure
-    struct TrackerData {
-        int tracker_id;
-        double x, y, z;
-        double qw, qx, qy, qz;
+    // --- FIX: Added helper structs for 3D math ---
+    struct Vec3 {
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+
+        float length() const { return std::sqrt(x * x + y * y + z * z); }
+
+        Vec3 normalize() const {
+            float len = length();
+            if (len > 1e-6f) return {x / len, y / len, z / len};
+            return {0.0f, 0.0f, 0.0f};
+        }
+
+        Vec3 operator-(const Vec3& other) const { return {x - other.x, y - other.y, z - other.z}; }
+        float dot(const Vec3& other) const { return x * other.x + y * other.y + z * other.z; }
+        Vec3 cross(const Vec3& other) const {
+            return {y * other.z - z * other.y, z * other.x - x * other.z, x * other.y - y * other.x};
+        }
+    };
+
+    struct Quaternion {
+        float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f;
     };
 
 public:
-    // IServerTrackedDeviceProvider methods
     EVRInitError Init(IVRDriverContext* pDriverContext) override {
         VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
-
         std::cout << "MediaPipe Driver initializing..." << std::endl;
 
-        // Create all potential trackers at startup
-        // MediaPipe body parts - adjust as needed
-        trackers_.resize(34);  // Reserve space for 34 trackers
+        left_controller_ = std::make_unique<VRControllerDevice>("MP_LeftController", true);
+        right_controller_ = std::make_unique<VRControllerDevice>("MP_RightController", false);
+        VRServerDriverHost()->TrackedDeviceAdded("MP_LeftController", TrackedDeviceClass_Controller, left_controller_.get());
+        VRServerDriverHost()->TrackedDeviceAdded("MP_RightController", TrackedDeviceClass_Controller, right_controller_.get());
 
-        // Basic trackers
-        CreateTracker("MP_Waist", 0);
-        CreateTracker("MP_LeftFoot", 1);
-        CreateTracker("MP_RightFoot", 2);
-        CreateTracker("MP_LeftHand", 3);
-        CreateTracker("MP_RightHand", 4);
-        CreateTracker("MP_LeftElbow", 5);
-        CreateTracker("MP_RightElbow", 6);
-        CreateTracker("MP_LeftKnee", 7);
-        CreateTracker("MP_RightKnee", 8);
-        CreateTracker("MP_Chest", 9);
+        // Create trackers with their roles
+        CreateTracker(11, "MP_LeftShoulder");
+        CreateTracker(12, "MP_RightShoulder");
+        CreateTracker(13, "MP_LeftElbow");
+        CreateTracker(14, "MP_RightElbow");
+        CreateTracker(15, "MP_LeftWrist");
+        CreateTracker(16, "MP_RightWrist");
+        CreateTracker(17, "MP_LeftPinky");
+        CreateTracker(18, "MP_RightPinky");
+        CreateTracker(19, "MP_LeftIndex");
+        CreateTracker(20, "MP_RightIndex");
+        CreateTracker(21, "MP_LeftThumb");
+        CreateTracker(22, "MP_RightThumb");
+        CreateTracker(23, "MP_LeftHip");
+        CreateTracker(24, "MP_RightHip");
+        CreateTracker(25, "MP_LeftKnee");
+        CreateTracker(26, "MP_RightKnee");
+        CreateTracker(27, "MP_LeftAnkle");
+        CreateTracker(28, "MP_RightAnkle");
+        CreateTracker(29, "MP_LeftHeel");
+        CreateTracker(30, "MP_RightHeel");
+        CreateTracker(31, "MP_LeftFootIndex");
+        CreateTracker(32, "MP_RightFootIndex");
 
-        // Torso/spine detail
-        CreateTracker("MP_LeftShoulder", 10);
-        CreateTracker("MP_RightShoulder", 11);
-        CreateTracker("MP_UpperChest", 12);
-        CreateTracker("MP_Neck", 13);
-        CreateTracker("MP_LeftHip", 14);
-        CreateTracker("MP_RightHip", 15);
-
-        // Left hand fingers
-        CreateTracker("MP_LeftWrist", 16);
-        CreateTracker("MP_LeftThumb", 17);
-        CreateTracker("MP_LeftIndex", 18);
-        CreateTracker("MP_LeftMiddle", 19);
-        CreateTracker("MP_LeftRing", 20);
-        CreateTracker("MP_LeftPinky", 21);
-
-        // Right hand fingers
-        CreateTracker("MP_RightWrist", 22);
-        CreateTracker("MP_RightThumb", 23);
-        CreateTracker("MP_RightIndex", 24);
-        CreateTracker("MP_RightMiddle", 25);
-        CreateTracker("MP_RightRing", 26);
-        CreateTracker("MP_RightPinky", 27);
-
-        // Additional leg detail
-        CreateTracker("MP_LeftAnkle", 28);
-        CreateTracker("MP_RightAnkle", 29);
-        CreateTracker("MP_LeftHeel", 30);
-        CreateTracker("MP_RightHeel", 31);
-        CreateTracker("MP_LeftFootIndex", 32);
-        CreateTracker("MP_RightFootIndex", 33);
-
-        // Start communication thread
         running_ = true;
         communication_thread_ = std::thread(&MediaPipeDriver::CommunicationLoop, this);
 
@@ -159,114 +245,175 @@ public:
 
     void Cleanup() override {
         running_ = false;
+
+        // Shutdown for the communication thread
+        // Closing the server socket will cause `accept()` to fail, unblocking the thread.
+        if (server_fd_ != -1) {
+            shutdown(server_fd_, SHUT_RDWR);
+            close(server_fd_);
+            server_fd_ = -1;
+        }
+
         if (communication_thread_.joinable()) {
             communication_thread_.join();
         }
+
+        left_controller_.reset();
+        right_controller_.reset();
         trackers_.clear();
+        VR_CLEANUP_SERVER_DRIVER_CONTEXT();
     }
 
-    const char* const* GetInterfaceVersions() override {
-        return k_InterfaceVersions;
-    }
-
-    void RunFrame() override {
-        // Called each frame by SteamVR
-    }
-
+    const char* const* GetInterfaceVersions() override { return k_InterfaceVersions; }
+    void RunFrame() override {}
     bool ShouldBlockStandbyMode() override { return false; }
     void EnterStandby() override {}
     void LeaveStandby() override {}
 
 private:
-    TrackerDevice* CreateTracker(const std::string& serial, int tracker_id) {
-        auto tracker = std::make_unique<TrackerDevice>(serial);
-        TrackerDevice* tracker_ptr = tracker.get();
+    // Rotation calculation logic
+    static Quaternion getLineRotationQuaternion(const Vec3& point1, const Vec3& point2, const Vec3& referenceDir = {0, 0, 1}) {
+        Vec3 lineDirection = (point2 - point1).normalize();
+        Vec3 refDir = referenceDir.normalize();
 
-        // Add to SteamVR
-        VRServerDriverHost()->TrackedDeviceAdded(serial.c_str(), TrackedDeviceClass_GenericTracker, tracker.get());
+        float dot = refDir.dot(lineDirection);
 
-        // Store in our vector
-        trackers_[tracker_id] = std::move(tracker);
+        if (std::abs(dot - 1.0f) < 1e-6f) { // Already aligned
+            return {1, 0, 0, 0};
+        }
+        if (std::abs(dot + 1.0f) < 1e-6f) { // 180-degree rotation
+            Vec3 perpendicular = std::abs(refDir.x) < 0.9f ? Vec3{1, 0, 0}.cross(refDir) : Vec3{0, 1, 0}.cross(refDir);
+            perpendicular = perpendicular.normalize();
+            return {0, perpendicular.x, perpendicular.y, perpendicular.z};
+        }
 
-        std::cout << "Created tracker: " << serial << " (ID: " << tracker_id << ")" << std::endl;
-        return tracker_ptr;
+        Vec3 axis = refDir.cross(lineDirection).normalize();
+        float angle = std::acos(dot) * 1.5f;
+        float halfAngle = angle * 0.75;
+        float sinHalf = std::sin(halfAngle);
+
+        return {std::cos(halfAngle), axis.x * sinHalf, axis.y * sinHalf, axis.z * sinHalf};
     }
 
-    // Unix socket communication for Linux
+    void CreateTracker(int id, const std::string& role) {
+        std::string serial = "MP_Tracker_" + std::to_string(id);
+        auto tracker = std::make_unique<TrackerDevice>(serial, role);
+        VRServerDriverHost()->TrackedDeviceAdded(serial.c_str(), TrackedDeviceClass_GenericTracker, tracker.get());
+        trackers_[id] = std::move(tracker);
+    }
+
     void CommunicationLoop() {
-        const char* socket_path = "/tmp/mediapipe_vr.sock";
+        // Store elbow positions as Vec3
+        Vec3 l_finger_pos, r_finger_pos;
 
-        // Clean up any existing socket file
-        unlink(socket_path);
+        const char* socket_path = "/tmp/vr_unix_socket.sock";
+        unlink(socket_path); // Remove old socket file if it exists
 
-        int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (server_fd == -1) {
-            std::cerr << "Failed to create socket" << std::endl;
+        server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd_ == -1) {
+            std::cerr << "Failed to create UNIX socket" << std::endl;
             return;
         }
 
         struct sockaddr_un addr = {};
         addr.sun_family = AF_UNIX;
-        strcpy(addr.sun_path, socket_path);
+        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-            std::cerr << "Failed to bind socket" << std::endl;
-            close(server_fd);
+        if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+            std::cerr << "Failed to bind UNIX socket" << std::endl;
+            close(server_fd_);
             return;
         }
 
-        if (listen(server_fd, 1) == -1) {
-            std::cerr << "Failed to listen on socket" << std::endl;
-            close(server_fd);
+        if (listen(server_fd_, 1) == -1) {
+            std::cerr << "Failed to listen on UNIX socket" << std::endl;
+            close(server_fd_);
             return;
         }
 
         std::cout << "Waiting for Python connection on " << socket_path << std::endl;
 
         while (running_) {
-            int client_fd = accept(server_fd, nullptr, nullptr);
+            int client_fd = accept(server_fd_, nullptr, nullptr);
             if (client_fd == -1) {
-                if (running_) {
-                    std::cerr << "Failed to accept connection" << std::endl;
-                }
+                if (running_) std::cerr << "Failed to accept connection" << std::endl;
                 continue;
             }
 
             std::cout << "Python connected!" << std::endl;
 
-            TrackerData data;
-            ssize_t bytes_read;
+            // Expected packet: 1 int32_t (ID) + 3 floats (x, y, z)
+            const size_t PACKET_SIZE = sizeof(int32_t) + 3 * sizeof(float);
+            char buffer[PACKET_SIZE];
 
             while (running_) {
-                bytes_read = read(client_fd, &data, sizeof(data));
-                if (bytes_read == sizeof(data) && data.tracker_id < trackers_.size()) {
-                    trackers_[data.tracker_id]->UpdatePose(
-                        data.x, data.y, data.z,
-                        data.qw, data.qx, data.qy, data.qz
-                    );
-                } else if (bytes_read <= 0) {
-                    break; // Connection closed
+                ssize_t bytes_received = recv(client_fd, buffer, PACKET_SIZE, MSG_WAITALL);
+
+                if (bytes_received == PACKET_SIZE) {
+                    // This data unpacking logic is correct for handling network byte order
+                    int32_t network_id;
+                    memcpy(&network_id, buffer, sizeof(int32_t));
+                    int32_t id = ntohl(network_id);
+
+                    float pos[3];
+                    for (int i = 0; i < 3; ++i) {
+                        uint32_t network_float_as_int;
+                        memcpy(&network_float_as_int, buffer + sizeof(int32_t) + (i * sizeof(float)), sizeof(uint32_t));
+                        uint32_t host_float_as_int = ntohl(network_float_as_int);
+                        memcpy(&pos[i], &host_float_as_int, sizeof(float));
+                    }
+
+                    auto it = trackers_.find(id);
+                    if (it != trackers_.end()) {
+                        // Update tracker with identity rotation
+                        it->second->UpdatePose(pos[0], pos[1], pos[2], 1, 0, 0, 0);
+                    }
+
+                    // Store elbow positions for controller rotation
+                    if (id == 19) { // Left index finger
+                        l_finger_pos = {pos[0], pos[1], pos[2]};
+                    } else if (id == 20) { // Right index finger
+                        r_finger_pos = {pos[0], pos[1], pos[2]};
+                    }
+
+                    // Update controllers if it's a wrist landmark
+                    if (id == 15) { // Left Wrist
+                        Vec3 wrist_pos = {pos[0], pos[1], pos[2]};
+                        // Call quaternion logic and update controller pose
+                        Quaternion l_rotation = getLineRotationQuaternion(l_finger_pos, wrist_pos);
+                        left_controller_->UpdatePose(pos[0] * 2.0f, pos[1], pos[2] * 2.0f, l_rotation.w, l_rotation.x, l_rotation.y, l_rotation.z);
+
+                    } else if (id == 16) { // Right Wrist
+                        Vec3 wrist_pos = {pos[0], pos[1], pos[2]};
+                        Quaternion r_rotation = getLineRotationQuaternion(r_finger_pos, wrist_pos);
+                        right_controller_->UpdatePose(pos[0] * 2.0f, pos[1], pos[2] * 2.0f, r_rotation.w, r_rotation.x, r_rotation.y, r_rotation.z);
+                    }
+
+                } else {
+                    std::cout << "Connection lost or error." << std::endl;
+                    break; // Exit inner loop and wait for a new connection
                 }
             }
 
             close(client_fd);
-            std::cout << "Python disconnected" << std::endl;
+            if(running_) std::cout << "Python disconnected. Waiting for new connection..." << std::endl;
         }
 
-        close(server_fd);
-        unlink(socket_path); // Clean up
+        // Final cleanup of the server socket
+        if (server_fd_ != -1) close(server_fd_);
+        unlink(socket_path);
     }
 };
 
-// Global driver instance
+// =================================================================
+// Driver Factory
+// =================================================================
 MediaPipeDriver g_driver;
 
-// Required exports for SteamVR
 extern "C" __attribute__((visibility("default"))) void* HmdDriverFactory(const char* interface_name, int* return_code) {
     if (strcmp(interface_name, IServerTrackedDeviceProvider_Version) == 0) {
         return &g_driver;
     }
-
     if (return_code) *return_code = VRInitError_Init_InterfaceNotFound;
     return nullptr;
 }
