@@ -17,4 +17,4 @@ Run uninstall.sh\
 It will remove the driver and python environment
 
 **To Do:**\
-Add emulated controllers to hands that connect to a physical console controller
+Redo most code to make it better and more updated
