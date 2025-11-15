@@ -11,6 +11,9 @@ cd $script_directory
 echo "Removing driver"
 rm -r $vr_steam_directory/drivers/mediapipe_driver
 
+echo "Removing model"
+rm pose_landmarker_heavy.task
+
 echo "Deleting environment"
 rm -r python_env
 
