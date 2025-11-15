@@ -1,5 +1,5 @@
-**A SteamVR tracking solution that uses mediapipe to run**
-Works with AlVR and phone VR
+**A SteamVR tracking solution that uses mediapipe to run**\
+Works with ALVR and phone VR
 
 -- Requirements:\
 Installed programs: SteamVR\
