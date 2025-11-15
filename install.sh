@@ -15,6 +15,9 @@ echo "Installing requirements"
 sudo apt update
 sudo apt install python3.12 python3.12-venv
 
+echo "Downloading tracking model"
+wget "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+
 echo "Creating virtual environment"
 python3.12 -m venv python_env
 source python_env/bin/activate
